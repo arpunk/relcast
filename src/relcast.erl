@@ -113,6 +113,7 @@
           db :: rocksdb:db_handle(),
           module :: atom(),
           modulestate :: any(),
+          old_serialized :: undefined | map() | binary(),
           id :: pos_integer(),
           ids :: [pos_integer()],
           last_sent = #{} :: #{pos_integer() => {rocksdb:cf_handle(), binary()} | none},
@@ -132,7 +133,8 @@
           transaction :: undefined | reference(),
           transaction_dirty = false :: boolean(),
           new_defers :: undefined | pos_integer(),  % right now this is just a counter for delivers
-          last_defer_check :: undefined | erlang:monotonic_time()
+          last_defer_check :: undefined | erlang:monotonic_time(),
+          write_key_tree :: boolean()
          }).
 
 -type relcast_state() :: #state{}.
@@ -155,6 +157,8 @@
         ]).
 
 -define(stored_module_state, <<"stored_module_state">>).
+-define(stored_key_prefix, <<"stored_key_">>).
+-define(stored_key_tree, <<"stored_key_tree">>).
 
 %% @doc Start a relcast instance. Starts a relcast instance for the actor
 %% `ActorID' in the group of `ActorIDs' using the callback module `Module'
@@ -212,21 +216,27 @@ start(ActorID, ActorIDs, Module, Arguments, RelcastOptions) ->
                          end,
     case Module:init(Arguments) of
         {ok, ModuleState0} ->
-            ModuleState = get_mod_state(DB, InboundCF, Module, ModuleState0),
+            {OldSer, ModuleState} = get_mod_state(DB, InboundCF, Module, ModuleState0),
             LastKeyIn = get_last_key_in(DB, InboundCF),
             LastKeyOut = get_last_key_out(DB, ActiveCF),
             BitFieldSize = round_to_nearest_byte(length(ActorIDs) + 2) - 2, %% two bits for unicast/multicast
+            %% we only want to write the key tree on the initial switchover or an upgrade.
+            %% TODO figure out how to retrigger on upgrade
+            WriteKeyTree = OldSer == undefined,
             State = #state{module = Module,
                            id = ActorID,
                            inbound_cf = InboundCF,
                            active_cf = ActiveCF,
                            ids = ActorIDs,
                            modulestate = ModuleState,
+                           old_serialized = OldSer,
                            db = DB,
                            out_key_count = LastKeyOut + 1,
                            in_key_count = LastKeyIn + 1,
                            epoch = Epoch,
-                           bitfieldsize = BitFieldSize},
+                           bitfieldsize = BitFieldSize,
+                           write_key_tree = WriteKeyTree
+                          },
             {ok, Iter} = rocksdb:iterator(State#state.db, InboundCF, [{iterate_upper_bound, max_inbound_key()}]),
             Defers = build_defer_list(rocksdb:iterator_move(Iter, {seek, min_inbound_key()}), Iter, InboundCF, #{}),
             %% try to deliver any old queued inbound messages
@@ -257,20 +267,16 @@ command(Message, State = #state{module = Module,
             %% write new output messages & update the state atomically
             case handle_actions(Actions, Transaction, State1) of
                 {ok, NewState} ->
-                    Dirty = maybe_serialize(Module, ModuleState,
-                                            NewState#state.modulestate,
-                                            NewState#state.transaction),
-                    case handle_pending_inbound(NewState#state.transaction, maybe_dirty(Dirty, NewState)) of
+                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
+                    case handle_pending_inbound(NewState#state.transaction, NewState1) of
                         {ok, NewerState} ->
                             {Reply, NewerState};
                         {stop, Timeout, NewerState} ->
                             {stop, Reply, Timeout, NewerState}
                     end;
                 {stop, Timeout, NewState} ->
-                    Dirty = maybe_serialize(Module, ModuleState,
-                                            NewState#state.modulestate,
-                                            NewState#state.transaction),
-                    {stop, Reply, Timeout, maybe_dirty(Dirty, NewState)}
+                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
+                    {stop, Reply, Timeout, NewState1}
             end
     end.
 
@@ -678,7 +684,7 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
             defer;
         {NewModuleState, Actions} ->
             %% write new outbound messages, update the state and (if present) delete the message atomically
-            Dirty1 =
+            Dirty =
                 case Key /= undefined of
                     true ->
                         ok = rocksdb:transaction_delete(Transaction, CF, Key),
@@ -688,15 +694,11 @@ handle_message(Key, CF, FromActorID, Message, Transaction, State = #state{module
                 end,
             case handle_actions(Actions, Transaction, State#state{modulestate=NewModuleState}) of
                 {ok, NewState} ->
-                    Dirty2 = maybe_serialize(Module, ModuleState,
-                                             NewState#state.modulestate,
-                                             Transaction),
-                    {ok, maybe_dirty(Dirty1 orelse Dirty2, NewState)};
+                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
+                    {ok, maybe_dirty(Dirty, NewState1)};
                 {stop, Timeout, NewState} ->
-                    Dirty2 = maybe_serialize(Module, ModuleState,
-                                             NewState#state.modulestate,
-                                             Transaction),
-                    {stop, Timeout, maybe_dirty(Dirty1 orelse Dirty2, NewState)}
+                    NewState1 = maybe_serialize(Module, ModuleState, NewState),
+                    {stop, Timeout, maybe_dirty(Dirty, NewState1)}
             end
     end.
 
@@ -801,6 +803,7 @@ round_to_nearest_byte(Bits) ->
             Bits + (8 - Extra)
     end.
 
+%% TODO: this whole thing is one way, we might need a downgrade path?
 get_mod_state(DB, OldCF, Module, ModuleState0) ->
     case rocksdb:get(DB, OldCF, ?stored_module_state, []) of
         {ok, SerializedModuleState} ->
@@ -812,14 +815,20 @@ get_mod_state(DB, OldCF, Module, ModuleState0) ->
                 {ok, SerializedModuleState} ->
                     rehydrate(Module, SerializedModuleState, ModuleState0);
                 not_found ->
-                    ModuleState0
+                    case rocksdb:get(DB, ?stored_key_tree, []) of
+                        {ok, KeyTreeBin} ->
+                            KeyTree = binary_to_term(KeyTreeBin),
+                            do_deserialize(Module, ModuleState0, ?stored_key_prefix, KeyTree, DB);
+                        not_found ->
+                            {undefined, ModuleState0}
+                    end
             end
     end.
 
 rehydrate(Module, SerState, ModuleState0) ->
     OldModuleState = Module:deserialize(SerState),
     {ok, RestoredModuleState} = Module:restore(OldModuleState, ModuleState0),
-    RestoredModuleState.
+    {SerState, RestoredModuleState}.
 
 %% get the maximum key ID used
 get_last_key_in(DB, CF) ->
@@ -1018,11 +1027,88 @@ make_seq(ID, #state{seq_map=SeqMap, ids=A}=State) ->
 reset_seq(ID, #state{seq_map=SeqMap}=State) ->
     State#state{seq_map=maps:remove(ID, SeqMap)}.
 
-maybe_serialize(_Mod, Old, New, _Transaction) when Old == New ->
-    false;
-maybe_serialize(Mod, _Old, New, Transaction) ->
-    ok = rocksdb:transaction_put(Transaction, ?stored_module_state, Mod:serialize(New)),
-    true.
+maybe_serialize(_Mod, Old, #state{modulestate = New} = S) when Old == New ->
+    S;
+maybe_serialize(Mod, _Old, #state{modulestate = New0,
+                                  old_serialized = Old,
+                                  transaction = Transaction} = S) ->
+    New = Mod:serialize(New0),
+    KeyTree = do_serialize(Mod, Old, New, ?stored_key_prefix, Transaction),
+    S1 = maybe_write_key_tree(KeyTree, S),
+    S1#state{old_serialized = New, transaction_dirty = true}.
+
+maybe_write_key_tree(_KeyTree, #state{write_key_tree = false} = S) ->
+    S;
+maybe_write_key_tree(KeyTree, S) ->
+    ok = rocksdb:transaction_put(S#state.transaction, ?stored_key_tree,
+                                 term_to_binary(KeyTree, [compressed])),
+    S#state{write_key_tree = false}.
+
+do_serialize(Mod, Old, New, Prefix, Transaction) ->
+    case New of
+        State when is_binary(State) ->
+            ok = rocksdb:transaction_put(Transaction, ?stored_module_state, State);
+        StateMap ->
+            S = lists:sort(maps:to_list(StateMap)),
+            O = case Old of
+                    %% since we're serialing for the first time, we need to make sure that
+                    %% everything gets written out, otherwise we have partial state that
+                    %% won't restore correctly.
+                    BorU when BorU == undefined orelse
+                              is_binary(BorU) ->
+                        lists:map(fun({K, _V}) -> {K, never_ever_match_with_anything} end, S);
+                    _ ->
+                        lists:sort(maps:to_list(Old))
+                end,
+            L = lists:zip(S, O),
+            KeyTree =
+                lists:map(
+                  fun({{K, V}, {_, V}}) ->
+                          %% should be a binary
+                          K;
+                     ({{K, V}, {_, OV}}) ->
+                          KeyName = <<Prefix/binary, (atom_to_binary(K, utf8))/binary>>,
+                          case is_map(V) of
+                              true ->
+                                  do_serialize(K, fixup_old_map(OV), V, <<KeyName/binary, "_">>, Transaction);
+                              false ->
+                                  ok = rocksdb:transaction_put(Transaction, KeyName,
+                                                               term_to_binary(V, [compressed])),
+                                  K
+                          end
+                  end,
+                  L),
+            [Mod | KeyTree]
+    end.
+
+fixup_old_map(never_ever_match_with_anything) ->
+    undefined;
+fixup_old_map(M) ->
+    M.
+
+%% this needs to return {serstate, restored modstate} I think
+do_deserialize(Mod, NewState, Prefix, KeyTree, RocksDB) ->
+    R = fun Rec(Pfix, [_Top | KT], DB) ->
+                lists:foldl(
+                  fun(K, Acc) when is_atom(K) ->
+                          KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary>>,
+                          Term = case rocksdb:get(DB, KeyName, []) of
+                                     {ok, Bin} ->
+                                         binary_to_term(Bin);
+                                     not_found ->
+                                         undefined
+                                 end,
+                          Acc#{K => Term};
+                     (L, Acc) when is_list(L) ->
+                          K = hd(L),
+                          KeyName = <<Pfix/binary, (atom_to_binary(K, utf8))/binary, "_">>,
+                          Acc#{K => Rec(KeyName, L, DB)}
+                  end,
+                  #{},
+                  KT)
+        end,
+    Map = R(Prefix, KeyTree, RocksDB),
+    rehydrate(Mod, Map, NewState).
 
 maybe_update_state(State, ignore) ->
     State;
