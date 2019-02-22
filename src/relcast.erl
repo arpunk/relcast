@@ -807,13 +807,27 @@ round_to_nearest_byte(Bits) ->
 get_mod_state(DB, OldCF, Module, ModuleState0) ->
     case rocksdb:get(DB, OldCF, ?stored_module_state, []) of
         {ok, SerializedModuleState} ->
-            ok = rocksdb:put(DB, ?stored_module_state, SerializedModuleState, []),
+            {_, Restored} = rehydrate(Module, SerializedModuleState, ModuleState0),
+            {ok, Txn} = rocksdb:transaction(DB, [{sync, true}]),
+            KeyTree = do_serialize(Module, undefined, Restored, ?stored_key_prefix, Txn),
+            ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
+                                         term_to_binary(KeyTree, [compressed])),
+            ok = rocksdb:transaction_commit(Txn),
+
             ok = rocksdb:delete(DB, OldCF, ?stored_module_state, []),
-            rehydrate(Module, SerializedModuleState, ModuleState0);
+            {Module:serialize(Restored), Restored};
         not_found ->
             case rocksdb:get(DB, ?stored_module_state, []) of
                 {ok, SerializedModuleState} ->
-                    rehydrate(Module, SerializedModuleState, ModuleState0);
+                    {_, Restored} = rehydrate(Module, SerializedModuleState, ModuleState0),
+                    {ok, Txn} = rocksdb:transaction(DB, [{sync, true}]),
+                    KeyTree = do_serialize(Module, undefined, Restored, ?stored_key_prefix, Txn),
+                    ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
+                                                 term_to_binary(KeyTree, [compressed])),
+                    ok = rocksdb:transaction_commit(Txn),
+
+                    ok = rocksdb:delete(DB, ?stored_module_state, []),
+                    {Module:serialize(Restored), Restored};
                 not_found ->
                     case rocksdb:get(DB, ?stored_key_tree, []) of
                         {ok, KeyTreeBin} ->

@@ -172,6 +172,7 @@ upgrade_stop_resume(_Config) ->
     ok.
 
 defer(_Config) ->
+    application:set_env(relcast, defer_count_threshold, 0),
     Actors = lists:seq(1, 3),
     {ok, RC1} = relcast:start(1, Actors, test_handler, [1], [{data_dir, "data3"}]),
     %% try to put an entry in the seq map, it will be deferred because the
