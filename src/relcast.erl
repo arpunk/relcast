@@ -809,7 +809,7 @@ get_mod_state(DB, OldCF, Module, ModuleState0) ->
         {ok, SerializedModuleState} ->
             {_, Restored} = rehydrate(Module, SerializedModuleState, ModuleState0),
             {ok, Txn} = rocksdb:transaction(DB, [{sync, true}]),
-            KeyTree = do_serialize(Module, undefined, Restored, ?stored_key_prefix, Txn),
+            KeyTree = do_serialize(Module, undefined, Module:serialize(Restored), ?stored_key_prefix, Txn),
             ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
                                          term_to_binary(KeyTree, [compressed])),
             ok = rocksdb:transaction_commit(Txn),
@@ -821,7 +821,7 @@ get_mod_state(DB, OldCF, Module, ModuleState0) ->
                 {ok, SerializedModuleState} ->
                     {_, Restored} = rehydrate(Module, SerializedModuleState, ModuleState0),
                     {ok, Txn} = rocksdb:transaction(DB, [{sync, true}]),
-                    KeyTree = do_serialize(Module, undefined, Restored, ?stored_key_prefix, Txn),
+                    KeyTree = do_serialize(Module, undefined, Module:serialize(Restored), ?stored_key_prefix, Txn),
                     ok = rocksdb:transaction_put(Txn, ?stored_key_tree,
                                                  term_to_binary(KeyTree, [compressed])),
                     ok = rocksdb:transaction_commit(Txn),
